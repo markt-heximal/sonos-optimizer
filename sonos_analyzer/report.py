@@ -127,7 +127,7 @@ def _html_speaker_row(sp: dict) -> str:
         f"<td>{escape(sp['ip_address'] or '')}</td>"
         f"<td>{escape(sp['model_name'] or '')}</td>"
         f"<td>{escape((sp['connection_type'] or '') + _band_text(sp))}</td>"
-        f"<td>{escape(sp['software_version'] or '')}</td>"
+        f"<td>{escape(_firmware_text(sp))}</td>"
         f"<td>{escape(_role_text(sp))}</td>"
         f"<td>{f'{rate:,.0f}' if rate is not None else ''}</td>"
         f"<td>{drop if drop is not None else ''}</td>"
@@ -140,6 +140,14 @@ def _role_text(sp: dict) -> str:
     if not role:
         return ""
     return f"stereo {role}"
+
+
+def _firmware_text(sp: dict) -> str:
+    display = sp.get("display_version") or ""
+    build = sp.get("software_version") or ""
+    if display and build:
+        return f"{display} (build {build})"
+    return display or build
 
 
 def _band_text(sp: dict) -> str:

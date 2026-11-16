@@ -37,30 +37,8 @@ def analyze(snapshot: HouseholdSnapshot) -> AnalysisReport:
     findings: list[Finding] = []
     recommendations: list[str] = []
 
-    firmware_versions: dict[str, list[str]] = {}
-    for sp in speakers:
-        firmware_versions.setdefault(sp.software_version or "unknown", []).append(sp.ip_address)
-
-    if len(firmware_versions) > 1:
-        versions = ", ".join(sorted(firmware_versions))
-        findings.append(
-            Finding(
-                severity="medium",
-                title="Firmware versions differ across speakers",
-                detail=f"Found multiple versions: {versions}. All speakers should run the same version.",
-                affected_ips=[ip for ips in firmware_versions.values() for ip in ips],
-            )
-        )
-    elif speakers:
-        version = next(iter(firmware_versions))
-        findings.append(
-            Finding(
-                severity="ok",
-                title="Firmware matched across household",
-                detail=f"All speakers report {version}.",
-                affected_ips=[sp.ip_address for sp in speakers],
-            )
-        )
+    firmware_versions = _firmware_versions(speakers)
+    findings.extend(_firmware_findings(speakers, firmware_versions))
 
     for first, second in _stereo_pairs(speakers):
         first_eth = _is_ethernet(first)
@@ -215,6 +193,74 @@ def analyze(snapshot: HouseholdSnapshot) -> AnalysisReport:
         recommendations=unique_recs,
         snapshot=snapshot,
     )
+
+
+def _firmware_versions(speakers: list[SpeakerDiagnostics]) -> dict[str, list[str]]:
+    """Group speaker IPs by the version to compare.
+
+    Uses the version the Sonos app shows (display_version, e.g. "27.3") when every
+    speaker reports one. Internal build numbers (software_version) can differ between
+    speaker models on the same release, so comparing them raises false alarms. Falls
+    back to software_version for everyone if any speaker lacks a display version, so
+    two different kinds of version string are never compared with each other.
+    """
+    use_display = bool(speakers) and all(sp.display_version for sp in speakers)
+    versions: dict[str, list[str]] = {}
+    for sp in speakers:
+        label = (sp.display_version if use_display else sp.software_version) or "unknown"
+        versions.setdefault(label, []).append(sp.ip_address)
+    return versions
+
+
+def _firmware_findings(
+    speakers: list[SpeakerDiagnostics], firmware_versions: dict[str, list[str]]
+) -> list[Finding]:
+    if not speakers:
+        return []
+    by_ip = {sp.ip_address: sp for sp in speakers}
+
+    if len(firmware_versions) == 1:
+        version = next(iter(firmware_versions))
+        return [
+            Finding(
+                severity="ok",
+                title="Firmware matched across household",
+                detail=f"All speakers report {version}.",
+                affected_ips=[sp.ip_address for sp in speakers],
+            )
+        ]
+
+    counts = sorted(((len(ips), v) for v, ips in firmware_versions.items()), reverse=True)
+    top_count, majority = counts[0]
+    has_majority = top_count > counts[1][0]
+    if has_majority:
+        affected = [ip for v, ips in firmware_versions.items() if v != majority for ip in ips]
+    else:
+        affected = [ip for ips in firmware_versions.values() for ip in ips]
+
+    names = ", ".join(
+        f"{by_ip[ip].zone_name or ip} ({ip}) on {_version_of(firmware_versions, ip)}"
+        for ip in affected
+    )
+    if has_majority:
+        n = len(affected)
+        title = f"{n} speaker{'s' if n != 1 else ''} not on the household's firmware version {majority}"
+        detail = (
+            f"{top_count} of {len(speakers)} speakers run {majority}. Different: {names}. "
+            "Update them from the Sonos app so all speakers run the same version."
+        )
+    else:
+        versions = ", ".join(sorted(firmware_versions))
+        title = "Firmware versions differ across speakers"
+        detail = (
+            f"No single version is on most speakers ({versions}): {names}. "
+            "Update from the Sonos app so all speakers run the same version."
+        )
+    return [Finding(severity="medium", title=title, detail=detail, affected_ips=affected)]
+
+
+def _version_of(firmware_versions: dict[str, list[str]], ip: str) -> str:
+    return next(v for v, ips in firmware_versions.items() if ip in ips)
 
 
 def _stereo_pairs(speakers: list[SpeakerDiagnostics]) -> list[tuple[SpeakerDiagnostics, SpeakerDiagnostics]]:

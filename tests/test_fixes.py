@@ -148,5 +148,48 @@ class PhyRateTests(unittest.TestCase):
         self.assertFalse([t for t in titles if "High Wi-Fi error rate" in t])
 
 
+class FirmwareTests(unittest.TestCase):
+    def _report(self, versions: list[tuple[str, str]]):
+        speakers = {}
+        for i, (display, build) in enumerate(versions):
+            ip = f"10.9.0.{i + 1}"
+            sp = SpeakerDiagnostics(zone_name=f"Room {i}", ip_address=ip)
+            sp.display_version, sp.software_version = display, build
+            speakers[ip] = sp
+        return analyze(HouseholdSnapshot(speakers=speakers, sample_seconds=0))
+
+    def _firmware(self, report):
+        return [f for f in report.findings if "irmware" in f.title]
+
+    def test_different_builds_same_app_version_is_not_a_mismatch(self) -> None:
+        # Seen live: 25 speakers on build 98.0 and an older model on 86.11, all "27.3".
+        report = self._report([("27.3", "98.0-82170")] * 3 + [("27.3", "86.11-82170")])
+        found = self._firmware(report)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].severity, "ok")
+        self.assertEqual(report.firmware_versions, {"27.3": ["10.9.0.1", "10.9.0.2", "10.9.0.3", "10.9.0.4"]})
+
+    def test_only_the_odd_speaker_is_named(self) -> None:
+        report = self._report([("27.3", "a")] * 3 + [("26.1", "b")])
+        found = self._firmware(report)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].severity, "medium")
+        self.assertEqual(found[0].affected_ips, ["10.9.0.4"])
+        self.assertIn("27.3", found[0].title)
+        self.assertIn("Room 3 (10.9.0.4) on 26.1", found[0].detail)
+
+    def test_even_split_names_everyone(self) -> None:
+        report = self._report([("27.3", "a"), ("26.1", "b")])
+        found = self._firmware(report)
+        self.assertEqual(found[0].title, "Firmware versions differ across speakers")
+        self.assertEqual(sorted(found[0].affected_ips), ["10.9.0.1", "10.9.0.2"])
+
+    def test_falls_back_to_build_when_any_app_version_missing(self) -> None:
+        report = self._report([("27.3", "98.0"), ("", "98.0"), ("27.3", "86.11")])
+        found = self._firmware(report)
+        self.assertEqual(found[0].affected_ips, ["10.9.0.3"])
+        self.assertIn("98.0", found[0].title)
+
+
 if __name__ == "__main__":
     unittest.main()

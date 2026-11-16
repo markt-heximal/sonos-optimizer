@@ -36,6 +36,19 @@ Target specific IPs (useful if discovery is blocked):
 sonos-analyzer --ips 192.168.1.165,192.168.1.89,192.168.1.193
 ```
 
+Discovery sends from every network interface on the machine and then reads the full speaker list from the first speaker that answers, so speakers that ignore discovery are still included. To search from one interface only:
+
+```bash
+sonos-analyzer --interface-ip 192.168.1.20
+```
+
+Wi-Fi error rates: each speaker's Wi-Fi error counter resets whenever it is read, so a single reading covers an unknown span of time. The analyzer reads twice, 30 seconds apart, and reports errors per second. Change or skip the wait:
+
+```bash
+sonos-analyzer --sample-seconds 60   # longer, steadier sample
+sonos-analyzer --sample-seconds 0    # skip; error rates are not reported
+```
+
 Write reports:
 
 ```bash
@@ -52,12 +65,12 @@ sonos-analyzer --ips 192.168.1.165 --json report.json --html report.html --quiet
 
 - Speaker inventory (room name, IP, model, firmware)
 - Firmware consistency across the household
-- Stereo pair topology (left coordinator vs right satellite)
+- Stereo pair topology (left/right, or main/partner when the speakers do not report which side is which)
 - Mixed Wi-Fi + Ethernet pairs (common cause of dropouts)
-- Wi-Fi channel and PHY error hints
+- Wi-Fi band per speaker (2.4 GHz vs 5 GHz) and measured Wi-Fi error rates, flagging speakers far above the household median
 - Bridge RX drop ratios (informational)
 - Trueplay / room calibration state hints
-- Actionable recommendations (wire both, swap speakers, Wi-Fi-only fallback, DHCP reservations)
+- Actionable recommendations (wire both, Wi-Fi-only fallback, DHCP reservations)
 
 ## Limitations
 

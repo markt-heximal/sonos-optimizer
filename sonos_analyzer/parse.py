@@ -48,11 +48,17 @@ class SpeakerDiagnostics:
     br0: IfconfigStats = field(default_factory=IfconfigStats)
     eth0: IfconfigStats = field(default_factory=IfconfigStats)
     phy_errors: int | None = None
+    # Errors per second over a timed sample window (the raw counter resets on
+    # every read, so a single reading covers an unknown span of time).
+    phy_errors_per_sec: float | None = None
     noise_floor_dbm: list[int] = field(default_factory=list)
     hal_reset_failures: int | None = None
     is_stereo_left: bool = False
     is_stereo_right: bool = False
     is_stereo_coordinator: bool = False
+    # "left" / "right" when the channel map says so; "main" / "partner" when
+    # both members report the same roles (sides cannot be told apart).
+    stereo_role: str = ""
 
 
 @dataclass
@@ -60,6 +66,7 @@ class HouseholdSnapshot:
     speakers: dict[str, SpeakerDiagnostics] = field(default_factory=dict)
     source_ips: list[str] = field(default_factory=list)
     fetch_errors: list[str] = field(default_factory=list)
+    sample_seconds: float = 0.0
 
 
 def parse_review_xml(xml_text: str) -> dict[str, SpeakerDiagnostics]:
@@ -84,7 +91,11 @@ def parse_device_description(xml_text: str) -> dict[str, str]:
         return {}
 
     def text(tag: str) -> str:
-        el = device.find(f"d:{tag}", ns) or device.find(tag)
+        # Compare with None explicitly: an Element with no children is falsy,
+        # so `find(...) or find(...)` silently discarded every found value.
+        el = device.find(f"d:{tag}", ns)
+        if el is None:
+            el = device.find(tag)
         return (el.text or "").strip() if el is not None else ""
 
     return {
@@ -255,19 +266,41 @@ def _apply_channel_map_roles(
     uuid: str,
 ) -> None:
     speaker.is_stereo_coordinator = uuid == coordinator and bool(channel_map)
-    if not channel_map:
+    roles = parse_channel_map(channel_map)
+    if uuid not in roles:
         return
 
-    for part in channel_map.split(";"):
+    left_tokens = {"LF", "L", "LEFT"}
+    right_tokens = {"RF", "R", "RIGHT"}
+    mine = roles[uuid]
+    plays_left = bool(mine & left_tokens)
+    plays_right = bool(mine & right_tokens)
+
+    if plays_left and not plays_right:
+        speaker.is_stereo_left = True
+        speaker.stereo_role = "left"
+    elif plays_right and not plays_left:
+        speaker.is_stereo_right = True
+        speaker.stereo_role = "right"
+    else:
+        # Newer firmware reports "LF,RF" for both members of a pair, so the
+        # map does not say which side is which. The visible member is the one
+        # the Sonos app shows; the invisible one sits behind it.
+        speaker.stereo_role = "partner" if speaker.is_invisible else "main"
+
+
+def parse_channel_map(channel_map: str) -> dict[str, set[str]]:
+    """Map each member UUID to its set of channel roles.
+
+    "A:LF,LF;B:RF,RF" -> {"A": {"LF"}, "B": {"RF"}}
+    """
+    roles: dict[str, set[str]] = {}
+    for part in (channel_map or "").split(";"):
         if ":" not in part:
             continue
         uid, rest = part.split(":", 1)
-        role = rest.split(",")[-1] if "," in rest else rest
-        if uid != uuid:
-            continue
-        role_upper = role.upper()
-        speaker.is_stereo_left = role_upper in {"LF", "L", "LEFT"}
-        speaker.is_stereo_right = role_upper in {"RF", "R", "RIGHT"}
+        roles[uid] = {r.strip().upper() for r in rest.split(",") if r.strip()}
+    return roles
 
 
 def _connection_type_label(code: str) -> str:

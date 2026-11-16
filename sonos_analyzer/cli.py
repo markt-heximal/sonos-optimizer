@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 from sonos_analyzer.analyze import analyze
 from sonos_analyzer.discovery import discover_speakers
-from sonos_analyzer.fetch import fetch_zone_group_state, probe_speaker
+from sonos_analyzer.fetch import (
+    fetch_device_description,
+    fetch_review,
+    fetch_zone_group_state,
+)
 from sonos_analyzer.parse import (
     HouseholdSnapshot,
     merge_speakers,
@@ -40,6 +45,19 @@ def main(argv: list[str] | None = None) -> int:
         help="SSDP discovery timeout in seconds (default: 3)",
     )
     parser.add_argument(
+        "--interface-ip",
+        action="append",
+        metavar="ADDR",
+        help="Local IPv4 address to send discovery from (repeatable; default: all interfaces)",
+    )
+    parser.add_argument(
+        "--sample-seconds",
+        type=float,
+        default=30.0,
+        help="Seconds between two diagnostic reads used to measure Wi-Fi error rates "
+        "(default: 30; 0 skips the measurement)",
+    )
+    parser.add_argument(
         "--json",
         metavar="PATH",
         help="Write JSON report to PATH",
@@ -60,7 +78,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.ips:
         ips = [ip.strip() for ip in args.ips.split(",") if ip.strip()]
     else:
-        discovered = discover_speakers(timeout=args.discover_timeout)
+        discovered = discover_speakers(
+            timeout=args.discover_timeout,
+            interface_ips=args.interface_ip,
+        )
         ips = [d.ip for d in discovered]
         if not ips:
             print(
@@ -70,7 +91,11 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
 
-    snapshot = _collect_snapshot(ips)
+    snapshot = _collect_snapshot(
+        ips,
+        sample_seconds=max(0.0, args.sample_seconds),
+        progress=not args.quiet,
+    )
     if not snapshot.speakers:
         print("Could not read diagnostics from any speaker.", file=sys.stderr)
         for err in snapshot.fetch_errors:
@@ -95,38 +120,97 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _collect_snapshot(ips: list[str]) -> HouseholdSnapshot:
-    snapshot = HouseholdSnapshot(source_ips=ips)
-    review_maps = []
-    group_maps = []
+def _collect_snapshot(
+    ips: list[str],
+    sample_seconds: float = 0.0,
+    progress: bool = False,
+) -> HouseholdSnapshot:
+    snapshot = HouseholdSnapshot(source_ips=list(ips))
+    group_maps: list[dict] = []
     descriptions: dict[str, dict[str, str]] = {}
+    unreachable: set[str] = set()
 
-    for ip in ips:
-        review_xml, desc_xml, err = probe_speaker(ip)
-        if err:
-            snapshot.fetch_errors.append(f"{ip}: {err.message}")
-            continue
-
-        if review_xml:
-            review_maps.append(parse_review_xml(review_xml))
-        if desc_xml:
-            descriptions[ip] = parse_device_description(desc_xml)
-
+    # 1. Topology: one reachable speaker lists every household member, which
+    #    also catches speakers that did not answer discovery.
+    queue = list(ips)
+    for ip in list(queue):
         try:
-            group_xml = fetch_zone_group_state(ip)
-            group_maps.append(parse_zone_group_state(group_xml))
-        except Exception as exc:  # noqa: BLE001 - surface as non-fatal
+            group_map = parse_zone_group_state(fetch_zone_group_state(ip))
+        except Exception as exc:  # noqa: BLE001 - try the next speaker
             snapshot.fetch_errors.append(f"{ip} zone group: {exc}")
+            continue
+        group_maps.append(group_map)
+        for member_ip in group_map:
+            if member_ip not in queue:
+                queue.append(member_ip)
+        break
 
-    snapshot.speakers = merge_speakers(*review_maps, *group_maps)
+    # 2. Device descriptions (model name) for every speaker.
+    for ip in queue:
+        try:
+            descriptions[ip] = parse_device_description(fetch_device_description(ip))
+        except Exception as exc:  # noqa: BLE001 - surface as non-fatal
+            snapshot.fetch_errors.append(f"{ip}: {exc}")
+            unreachable.add(ip)
+
+    # 3. Diagnostics. /support/review on one speaker returns every speaker, and
+    #    reading it resets each Wi-Fi PHY error counter. Read once, wait a known
+    #    time, read again: the second reading is errors over that window.
+    review_map: dict = {}
+    review_ip = None
+    first_read_at = 0.0
+    for ip in queue:
+        if ip in unreachable:
+            continue
+        try:
+            started = time.monotonic()
+            review_map = parse_review_xml(fetch_review(ip))
+            first_read_at = (started + time.monotonic()) / 2
+            review_ip = ip
+            break
+        except Exception as exc:  # noqa: BLE001 - try the next speaker
+            snapshot.fetch_errors.append(f"{ip} review: {exc}")
+
+    if review_ip and sample_seconds > 0:
+        if progress:
+            print(
+                f"Sampling Wi-Fi error rates for {sample_seconds:g}s "
+                "(use --sample-seconds 0 to skip)...",
+                file=sys.stderr,
+            )
+        time.sleep(sample_seconds)
+        try:
+            started = time.monotonic()
+            second = parse_review_xml(fetch_review(review_ip))
+            elapsed = (started + time.monotonic()) / 2 - first_read_at
+            for sp in second.values():
+                if sp.phy_errors is not None and elapsed > 0:
+                    sp.phy_errors_per_sec = sp.phy_errors / elapsed
+            review_map = second
+            snapshot.sample_seconds = elapsed
+        except Exception as exc:  # noqa: BLE001 - keep the first reading
+            snapshot.fetch_errors.append(f"{review_ip} review (second sample): {exc}")
+
+    # Speakers missing from the household review get their own fetch.
+    extra_reviews = []
+    for ip in queue:
+        if ip in review_map or ip in unreachable or review_ip is None:
+            continue
+        try:
+            extra_reviews.append(parse_review_xml(fetch_review(ip)))
+        except Exception as exc:  # noqa: BLE001
+            snapshot.fetch_errors.append(f"{ip} review: {exc}")
+
+    snapshot.speakers = merge_speakers(review_map, *extra_reviews, *group_maps)
+    snapshot.source_ips = queue
 
     for ip, meta in descriptions.items():
         if ip not in snapshot.speakers:
             continue
         speaker = snapshot.speakers[ip]
-        speaker.model_name = meta.get("model_name", speaker.model_name)
-        speaker.model_number = meta.get("model_number", speaker.model_number)
-        speaker.display_version = meta.get("display_version", speaker.display_version)
+        speaker.model_name = meta.get("model_name") or speaker.model_name
+        speaker.model_number = meta.get("model_number") or speaker.model_number
+        speaker.display_version = meta.get("display_version") or speaker.display_version
 
     return snapshot
 

@@ -24,19 +24,16 @@ def print_terminal(report: AnalysisReport) -> None:
     print()
 
     print("Speakers")
-    print("-" * 72)
+    print("-" * 100)
     for sp in report.speakers:
-        role = []
-        if sp["is_stereo_left"]:
-            role.append("stereo L/coordinator")
-        if sp["is_stereo_right"]:
-            role.append("stereo R")
-        role_text = f" [{', '.join(role)}]" if role else ""
-        drop = sp["br0_rx_drop_ratio_pct"]
-        drop_text = f", RX drop {drop}%" if drop is not None else ""
+        role = _role_text(sp)
+        role_text = f" [{role}]" if role else ""
+        band = _band_text(sp)
+        rate = sp.get("phy_errors_per_sec")
+        rate_text = f", Wi-Fi errors {rate:,.0f}/s" if rate is not None else ""
         print(
-            f"  {sp['zone_name']:<22} {sp['ip_address']:<16} "
-            f"{sp['connection_type'] or 'unknown'}{role_text}{drop_text}"
+            f"  {sp['zone_name']:<28} {sp['ip_address']:<15} {sp['model_name'] or '?':<18} "
+            f"{sp['connection_type'] or 'unknown'}{band}{role_text}{rate_text}"
         )
     print()
 
@@ -104,7 +101,7 @@ def write_html(report: AnalysisReport, path: Path) -> None:
   <table>
     <thead>
       <tr>
-        <th>Room</th><th>IP</th><th>Connection</th><th>Firmware</th><th>Role</th><th>RX drop %</th>
+        <th>Room</th><th>IP</th><th>Model</th><th>Connection</th><th>Firmware</th><th>Stereo role</th><th>Wi-Fi errors/s</th><th>RX drop %</th>
       </tr>
     </thead>
     <tbody>{speaker_rows}</tbody>
@@ -122,21 +119,37 @@ def write_html(report: AnalysisReport, path: Path) -> None:
 
 
 def _html_speaker_row(sp: dict) -> str:
-    role = []
-    if sp["is_stereo_left"]:
-        role.append("L / coordinator")
-    if sp["is_stereo_right"]:
-        role.append("R")
+    rate = sp.get("phy_errors_per_sec")
+    drop = sp["br0_rx_drop_ratio_pct"]
     return (
         "<tr>"
         f"<td>{escape(sp['zone_name'] or '')}</td>"
         f"<td>{escape(sp['ip_address'] or '')}</td>"
-        f"<td>{escape(sp['connection_type'] or '')}</td>"
+        f"<td>{escape(sp['model_name'] or '')}</td>"
+        f"<td>{escape((sp['connection_type'] or '') + _band_text(sp))}</td>"
         f"<td>{escape(sp['software_version'] or '')}</td>"
-        f"<td>{escape(', '.join(role))}</td>"
-        f"<td>{sp['br0_rx_drop_ratio_pct'] if sp['br0_rx_drop_ratio_pct'] is not None else ''}</td>"
+        f"<td>{escape(_role_text(sp))}</td>"
+        f"<td>{f'{rate:,.0f}' if rate is not None else ''}</td>"
+        f"<td>{drop if drop is not None else ''}</td>"
         "</tr>"
     )
+
+
+def _role_text(sp: dict) -> str:
+    role = sp.get("stereo_role") or ""
+    if not role:
+        return ""
+    return f"stereo {role}"
+
+
+def _band_text(sp: dict) -> str:
+    if sp.get("ethernet_link") or "ethernet" in (sp.get("connection_type") or "").lower():
+        return ""
+    try:
+        mhz = int(sp.get("wifi_channel_mhz") or "")
+    except ValueError:
+        return ""
+    return " 2.4 GHz" if mhz < 3000 else " 5 GHz"
 
 
 def _html_finding(finding: Finding) -> str:

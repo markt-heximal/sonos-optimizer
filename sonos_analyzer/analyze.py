@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import re
+import statistics
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from sonos_analyzer.parse import HouseholdSnapshot, SpeakerDiagnostics
+from sonos_analyzer.parse import HouseholdSnapshot, SpeakerDiagnostics, parse_channel_map
+
+PHY_RATE_FLOOR = 50.0  # errors per second
+PHY_RATE_MEDIAN_MULTIPLE = 3.0
 
 
 @dataclass
@@ -57,72 +62,58 @@ def analyze(snapshot: HouseholdSnapshot) -> AnalysisReport:
             )
         )
 
-    stereo_groups = _stereo_pairs(speakers)
-    for left, right in stereo_groups:
-        left_wifi = _is_wifi(left)
-        right_wifi = _is_wifi(right)
-        left_eth = _is_ethernet(left)
-        right_eth = _is_ethernet(right)
+    for first, second in _stereo_pairs(speakers):
+        first_eth = _is_ethernet(first)
+        second_eth = _is_ethernet(second)
+        pair_name = _base_zone_name(first.zone_name)
+        members = [first.ip_address, second.ip_address]
 
-        if left_wifi and right_eth:
+        if first_eth != second_eth:
+            wired, wireless = (first, second) if first_eth else (second, first)
             findings.append(
                 Finding(
                     severity="high",
-                    title=f"Stereo pair '{left.zone_name}' is mixed Wi-Fi + Ethernet",
+                    title=f"Stereo pair '{pair_name}' is mixed Wi-Fi + Ethernet",
                     detail=(
-                        f"{left.zone_name} ({left.ip_address}) is the stereo coordinator on Wi-Fi, "
-                        f"while {right.zone_name} ({right.ip_address}) is wired with Wi-Fi disabled. "
-                        "Sonos stereo pairs work best when both speakers share the same network path. "
-                        "If you cannot wire the left speaker, unplug the right speaker and use Wi-Fi only, "
-                        "or physically swap the speakers so the wired unit sits on the left and re-pair."
+                        f"{_role_label(wired)} speaker ({wired.ip_address}) is wired, while "
+                        f"{_role_label(wireless).lower()} speaker ({wireless.ip_address}) is on Wi-Fi. "
+                        "Sonos stereo pairs work best when both speakers share the same network path: "
+                        "wire both, or unplug the cable and run both on Wi-Fi."
                     ),
-                    affected_ips=[left.ip_address, right.ip_address],
+                    affected_ips=members,
                 )
             )
             recommendations.append(
-                "Family Room / stereo pair: if only the right-side Ethernet jack is usable, "
-                "either swap speakers and re-pair with the wired unit as Left, or unplug Ethernet "
-                "and run both speakers on Wi-Fi."
+                f"{pair_name} stereo pair: wire both speakers, or unplug Ethernet and run both on Wi-Fi."
             )
-        elif left_eth and right_wifi:
-            findings.append(
-                Finding(
-                    severity="high",
-                    title=f"Stereo pair '{left.zone_name}' has wired coordinator but wireless right",
-                    detail=(
-                        "The left coordinator is wired, but the right speaker is on Wi-Fi. "
-                        "Prefer both wired, or both wireless."
-                    ),
-                    affected_ips=[left.ip_address, right.ip_address],
-                )
-            )
-        elif left_eth and right_eth:
+        elif first_eth and second_eth:
             findings.append(
                 Finding(
                     severity="ok",
-                    title=f"Stereo pair '{left.zone_name}' is fully wired",
+                    title=f"Stereo pair '{pair_name}' is fully wired",
                     detail="Both speakers use Ethernet — ideal topology for a stereo pair.",
-                    affected_ips=[left.ip_address, right.ip_address],
+                    affected_ips=members,
                 )
             )
 
-    wifi_speakers = [sp for sp in speakers if _is_wifi(sp) and not _is_ethernet(sp)]
-    if wifi_speakers:
-        channels = {sp.wifi_channel_mhz for sp in wifi_speakers if sp.wifi_channel_mhz}
-        if channels:
-            ch_list = ", ".join(sorted(channels))
-            findings.append(
-                Finding(
-                    severity="medium",
-                    title="Wireless speakers use 2.4 GHz Wi-Fi",
-                    detail=(
-                        f"Operating channel(s): {ch_list} MHz. "
-                        "Many Sonos models (including SYMFONISK Bookshelf S21) are 2.4 GHz only. "
-                        "Ethernet is the best way to avoid congestion if a cable is available."
-                    ),
-                    affected_ips=[sp.ip_address for sp in wifi_speakers],
-                )
+    wireless = [sp for sp in speakers if not _is_ethernet(sp) and _channel_mhz(sp) is not None]
+    on_24 = [sp for sp in wireless if _channel_mhz(sp) < 3000]
+    if on_24:
+        rooms = ", ".join(sorted({_base_zone_name(sp.zone_name) for sp in on_24}))
+        findings.append(
+            Finding(
+                severity="low",
+                title=f"{len(on_24)} of {len(wireless)} wireless speakers use 2.4 GHz Wi-Fi",
+                detail=(
+                    f"Rooms: {rooms}. 2.4 GHz is usually more crowded than 5 GHz and is where "
+                    "most interference shows up. Ethernet avoids Wi-Fi congestion entirely "
+                    "if a cable is available."
+                ),
+                affected_ips=[sp.ip_address for sp in on_24],
             )
+        )
+
+    phy_threshold = _phy_rate_threshold(speakers)
 
     for sp in speakers:
         drop_ratio = _rx_drop_ratio(sp)
@@ -140,14 +131,18 @@ def analyze(snapshot: HouseholdSnapshot) -> AnalysisReport:
                 )
             )
 
-        if sp.phy_errors is not None and sp.phy_errors > 5000:
+        rate = sp.phy_errors_per_sec
+        if phy_threshold is not None and rate is not None and rate >= phy_threshold:
+            band = "2.4 GHz" if (_channel_mhz(sp) or 0) < 3000 else "5 GHz"
             findings.append(
                 Finding(
                     severity="medium",
-                    title=f"Elevated Wi-Fi PHY errors on {sp.zone_name}",
+                    title=f"High Wi-Fi error rate on {sp.zone_name}",
                     detail=(
-                        f"{sp.zone_name} reports {sp.phy_errors:,} PHY errors since last reset. "
-                        "Check signal strength, channel congestion, and router 2.4 GHz width (use 20 MHz)."
+                        f"{sp.zone_name} logged {rate:,.0f} Wi-Fi PHY errors per second over "
+                        f"{snapshot.sample_seconds:.0f}s on {band} (household typical: "
+                        f"{_median_phy_rate(speakers):,.0f}/s). Errors this far above the rest of "
+                        "the house usually mean weak signal or interference near this speaker."
                     ),
                     affected_ips=[sp.ip_address],
                 )
@@ -175,6 +170,19 @@ def analyze(snapshot: HouseholdSnapshot) -> AnalysisReport:
                     affected_ips=[sp.ip_address],
                 )
             )
+
+    if snapshot.sample_seconds <= 0:
+        findings.append(
+            Finding(
+                severity="low",
+                title="Wi-Fi error rates not measured",
+                detail=(
+                    "Each speaker's Wi-Fi error counter resets whenever it is read, so a single "
+                    "reading covers an unknown span of time. Run with --sample-seconds 30 (the "
+                    "default) to measure errors per second."
+                ),
+            )
+        )
 
     if not recommendations:
         recommendations.append(
@@ -210,39 +218,69 @@ def analyze(snapshot: HouseholdSnapshot) -> AnalysisReport:
 
 
 def _stereo_pairs(speakers: list[SpeakerDiagnostics]) -> list[tuple[SpeakerDiagnostics, SpeakerDiagnostics]]:
+    """Return (first, second) for every two-speaker stereo pair.
+
+    Order is left/main first when known. Works whether or not the channel map
+    tells the sides apart.
+    """
     by_uid = {sp.local_uid: sp for sp in speakers if sp.local_uid}
     pairs: list[tuple[SpeakerDiagnostics, SpeakerDiagnostics]] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, ...]] = set()
+    order = {"left": 0, "main": 0, "right": 1, "partner": 1}
 
-    for left in [sp for sp in speakers if sp.is_stereo_left and sp.channel_map_set]:
-        right_uid = None
-        for part in left.channel_map_set.split(";"):
-            if ":" not in part:
-                continue
-            uid, rest = part.split(":", 1)
-            role = rest.split(",")[-1].upper()
-            if role in {"RF", "R", "RIGHT"}:
-                right_uid = uid
-                break
-        if not right_uid:
+    for sp in speakers:
+        uids = list(parse_channel_map(sp.channel_map_set))
+        if len(uids) != 2:
             continue
-
-        right = by_uid.get(right_uid)
-        if right is None:
+        members = [by_uid.get(uid) for uid in uids]
+        if any(m is None for m in members):
             continue
-
-        key = tuple(sorted([left.ip_address, right.ip_address]))
+        key = tuple(sorted(m.ip_address for m in members))
         if key in seen:
             continue
         seen.add(key)
-        pairs.append((left, right))
+        members.sort(key=lambda m: order.get(m.stereo_role, 2))
+        pairs.append((members[0], members[1]))
 
     return pairs
 
 
-def _is_wifi(sp: SpeakerDiagnostics) -> bool:
-    conn = (sp.connection_type or "").lower()
-    return "wifi" in conn or sp.connection_type_code == "5"
+def _role_label(sp: SpeakerDiagnostics) -> str:
+    return {
+        "left": "The left",
+        "right": "The right",
+        "main": "The main",
+        "partner": "The partner",
+    }.get(sp.stereo_role, "One")
+
+
+def _base_zone_name(name: str) -> str:
+    # Sonos appends channel roles, e.g. "Living Room (L+R)" or "Den (LF,RF)".
+    return re.sub(r"\s*\([A-Z+,]+\)\s*$", "", name or "").strip() or name
+
+
+def _channel_mhz(sp: SpeakerDiagnostics) -> int | None:
+    try:
+        return int(sp.wifi_channel_mhz)
+    except (TypeError, ValueError):
+        return None
+
+
+def _median_phy_rate(speakers: list[SpeakerDiagnostics]) -> float:
+    rates = [sp.phy_errors_per_sec for sp in speakers if sp.phy_errors_per_sec is not None]
+    return statistics.median(rates) if rates else 0.0
+
+
+def _phy_rate_threshold(speakers: list[SpeakerDiagnostics]) -> float | None:
+    """Flag speakers well above the rest of the household.
+
+    There is no published "normal" PHY error rate, so compare speakers to each
+    other: at least 3x the household median and at least 50 errors/second.
+    """
+    rates = [sp.phy_errors_per_sec for sp in speakers if sp.phy_errors_per_sec is not None]
+    if not rates:
+        return None
+    return max(PHY_RATE_FLOOR, PHY_RATE_MEDIAN_MULTIPLE * statistics.median(rates))
 
 
 def _is_ethernet(sp: SpeakerDiagnostics) -> bool:
@@ -280,8 +318,10 @@ def _speaker_to_dict(sp: SpeakerDiagnostics) -> dict:
         "is_stereo_left": sp.is_stereo_left,
         "is_stereo_right": sp.is_stereo_right,
         "is_stereo_coordinator": sp.is_stereo_coordinator,
+        "stereo_role": sp.stereo_role,
         "br0_rx_drop_ratio_pct": round(drop_ratio, 1) if drop_ratio is not None else None,
         "br0_rx_packets": sp.br0.rx_packets,
         "br0_rx_dropped": sp.br0.rx_dropped,
         "phy_errors": sp.phy_errors,
+        "phy_errors_per_sec": round(sp.phy_errors_per_sec, 1) if sp.phy_errors_per_sec is not None else None,
     }
